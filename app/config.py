@@ -41,6 +41,30 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.1
     llm_max_tokens: int = 1500
 
+    # --- Database (PostgreSQL, optional) ---
+    # Empty string disables DB integration. When set, the query_database
+    # tool will use it. Example:
+    #   postgresql://rca_ro:secret@localhost:5432/rca_ops
+    database_url: str = ""
+    database_pool_min: int = Field(default=1, ge=0, le=50)
+    database_pool_max: int = Field(default=5, ge=1, le=100)
+    database_query_timeout_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
+    database_statement_timeout_ms: int = Field(default=5000, ge=100, le=60000)
+
+    # --- Aerospike (NoSQL, optional) ---
+    # Empty AEROSPIKE_HOSTS disables integration. When both hosts +
+    # namespace are set, the query_aerospike tool becomes available.
+    # Hosts format: comma-separated ``host:port`` list, e.g.
+    #   "cache-1.internal:3000,cache-2.internal:3000"
+    aerospike_hosts: str = ""
+    aerospike_namespace: str = ""
+    aerospike_username: str = ""
+    aerospike_password: str = ""
+    aerospike_total_timeout_ms: int = Field(default=1000, ge=50, le=60000)
+    aerospike_query_timeout_seconds: float = Field(
+        default=2.0, ge=0.1, le=60.0
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

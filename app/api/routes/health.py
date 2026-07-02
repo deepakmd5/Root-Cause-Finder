@@ -4,9 +4,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from app import __version__
-from app.api.dependencies import get_llm
+from app.api.dependencies import get_aerospike, get_database, get_llm
 from app.config import Settings, get_settings
 from app.llm.base import LLMAdapter
+from app.services.aerospike_client import AerospikeClient
+from app.services.database import DatabaseClient
 from app.tools.registry import get_registry
 
 router = APIRouter(tags=["health"])
@@ -21,6 +23,8 @@ def health() -> dict[str, str]:
 def readiness(
     settings: Settings = Depends(get_settings),
     llm: LLMAdapter = Depends(get_llm),
+    db: DatabaseClient = Depends(get_database),
+    aerospike: AerospikeClient = Depends(get_aerospike),
 ) -> dict[str, object]:
     return {
         "status": "ready",
@@ -28,4 +32,12 @@ def readiness(
         "environment": settings.app_env,
         "llm_provider": llm.name,
         "tools": get_registry().names(),
+        "database": {
+            "configured": db.is_configured,
+            "connected": db.is_connected,
+        },
+        "aerospike": {
+            "configured": aerospike.is_configured,
+            "connected": aerospike.is_connected,
+        },
     }

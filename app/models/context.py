@@ -66,6 +66,44 @@ class SimilarIncident(BaseModel):
     similarity_score: float = Field(ge=0.0, le=1.0)
 
 
+class DbRecord(BaseModel):
+    """A single result set returned by the ``query_database`` tool.
+
+    Stored on the context so the agent (and every downstream consumer)
+    can trace which rows came from which allowlisted query with which
+    parameters.
+    """
+
+    query_name: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    row_count: int
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    fetched_at: datetime | None = None
+    available: bool = True
+    error: str | None = None
+
+
+class AerospikeRecord(BaseModel):
+    """A single key lookup returned by the ``query_aerospike`` tool.
+
+    Kept on the context so the agent (and downstream consumers) can
+    trace which allowlisted operation produced which cached record.
+    ``found=False`` means the key was queried but no record existed -
+    still valuable evidence (e.g. "session was already expired").
+    """
+
+    operation: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    namespace: str | None = None
+    set_name: str | None = None
+    key: str | None = None
+    found: bool = False
+    record: dict[str, Any] | None = None
+    fetched_at: datetime | None = None
+    available: bool = True
+    error: str | None = None
+
+
 class NormalizedContext(BaseModel):
     """Vendor-agnostic view of an incident.
 
@@ -86,3 +124,5 @@ class NormalizedContext(BaseModel):
     traces: list[TraceSpan] = Field(default_factory=list)
     dependencies: list[ServiceDependency] = Field(default_factory=list)
     similar_incidents: list[SimilarIncident] = Field(default_factory=list)
+    db_records: list[DbRecord] = Field(default_factory=list)
+    aerospike_records: list[AerospikeRecord] = Field(default_factory=list)

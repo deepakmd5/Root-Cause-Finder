@@ -1,6 +1,8 @@
 """Pydantic domain models used across the service."""
 from app.models.alert import Alert, AlertSeverity, AlertSource, IncomingAlert
 from app.models.context import (
+    AerospikeRecord,
+    DbRecord,
     DeploymentEvent,
     LogEntry,
     MetricSample,
@@ -22,6 +24,8 @@ __all__ = [
     "AlertSeverity",
     "AlertSource",
     "IncomingAlert",
+    "AerospikeRecord",
+    "DbRecord",
     "DeploymentEvent",
     "LogEntry",
     "MetricSample",

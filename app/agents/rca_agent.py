@@ -21,6 +21,8 @@ from app.core.exceptions import AgentBudgetExceeded, LLMError
 from app.core.logging import get_logger
 from app.llm.base import AgentDecision, DecisionType, LLMAdapter, LLMMessage
 from app.models.context import (
+    AerospikeRecord,
+    DbRecord,
     DeploymentEvent,
     LogEntry,
     MetricSample,
@@ -30,7 +32,12 @@ from app.models.context import (
     TraceSpan,
 )
 from app.models.investigation import AgentStep, Investigation, StepType
-from app.models.rca import Hypothesis, RCAReport, RemediationAction
+from app.models.rca import (
+    Hypothesis,
+    RCAReport,
+    RemediationAction,
+    RemediationPriority,
+)
 from app.tools.registry import ToolRegistry
 
 log = get_logger(__name__)
@@ -94,6 +101,7 @@ class RCAAgent:
 
                 if decision.type == DecisionType.FINALIZE:
                     report = self._parse_report(decision, investigation.context)
+                    report = self._apply_guardrails(report, investigation.context)
                     investigation.steps.append(
                         AgentStep(
                             index=len(investigation.steps) + 1,
@@ -251,6 +259,33 @@ class RCAAgent:
             ctx.similar_incidents.extend(
                 SimilarIncident(**i) for i in data.get("incidents", [])
             )
+        elif tool == "query_database":
+            ctx.db_records.append(
+                DbRecord(
+                    query_name=data.get("query_name") or "",
+                    params=data.get("params") or {},
+                    row_count=int(data.get("row_count", 0)),
+                    rows=list(data.get("rows", [])),
+                    fetched_at=None,  # kept as str inside data for provenance
+                    available=bool(data.get("available", False)),
+                    error=data.get("error"),
+                )
+            )
+        elif tool == "query_aerospike":
+            ctx.aerospike_records.append(
+                AerospikeRecord(
+                    operation=data.get("operation") or "",
+                    params=data.get("params") or {},
+                    namespace=data.get("namespace"),
+                    set_name=data.get("set"),
+                    key=data.get("key"),
+                    found=bool(data.get("found", False)),
+                    record=data.get("record"),
+                    fetched_at=None,  # kept as str inside data for provenance
+                    available=bool(data.get("available", False)),
+                    error=data.get("error"),
+                )
+            )
 
     def _parse_report(
         self,
@@ -303,3 +338,147 @@ class RCAAgent:
             ),
             references=list(payload.get("references", [])),
         )
+
+    # -- Guardrails -------------------------------------------------------
+
+    def _apply_guardrails(
+        self,
+        report: RCAReport,
+        context: NormalizedContext,
+    ) -> RCAReport:
+        """Post-process the report to prevent evidence-free RCAs.
+
+        The LLM's own answer is trusted only when *service-specific*
+        telemetry actually landed in the context during the
+        investigation. If nothing did (unknown service, silent pipeline,
+        stale lookback, ...) we replace the primary hypothesis with an
+        honest "insufficient evidence" verdict rather than emit a
+        confident-sounding hallucination.
+        """
+        if _has_service_specific_evidence(context):
+            return report
+
+        service = context.alert.service
+        insufficient = Hypothesis(
+            statement=(
+                "Insufficient evidence to determine root cause. "
+                f"No service-specific telemetry (logs, metrics, traces, "
+                f"deployments) was found for `{service}` within the "
+                f"lookback window."
+            ),
+            confidence=0.1,
+            supporting_evidence=[],
+            contradicting_evidence=[],
+        )
+        remediation = [
+            RemediationAction(
+                title="Verify service identity and telemetry pipeline",
+                description=(
+                    f"Confirm that the alert's service name '{service}' "
+                    "matches what the observability stack indexes. Check "
+                    "log shipping, metric scraping, and trace ingestion "
+                    "for the service."
+                ),
+                priority=RemediationPriority.IMMEDIATE,
+                owner_hint="observability",
+            ),
+            RemediationAction(
+                title="Widen the investigation lookback window",
+                description=(
+                    "Re-run the investigation with an extended lookback "
+                    "(e.g. 4h) in case the causing event fell outside "
+                    "the default 30m window."
+                ),
+                priority=RemediationPriority.SHORT_TERM,
+                owner_hint="on-call",
+            ),
+        ]
+        summary = (
+            f"Investigation completed but no service-specific telemetry "
+            f"was gathered for `{service}`. Reporting insufficient "
+            "evidence rather than guessing a root cause."
+        )
+        headline = f"Insufficient evidence for {service}"
+
+        # Downgrade any alternate hypotheses so they can't be confused
+        # for a confident answer.
+        downgraded_alternates = [
+            Hypothesis(
+                statement=alt.statement,
+                confidence=min(alt.confidence, 0.15),
+                supporting_evidence=alt.supporting_evidence,
+                contradicting_evidence=alt.contradicting_evidence
+                + ["Not supported by service-specific telemetry."],
+            )
+            for alt in report.alternate_hypotheses
+        ]
+
+        return report.model_copy(
+            update={
+                "headline": headline,
+                "summary": summary,
+                "primary_hypothesis": insufficient,
+                "alternate_hypotheses": downgraded_alternates,
+                "remediation": remediation,
+                "confidence": 0.1,
+            }
+        )
+
+
+def _has_service_specific_evidence(context: NormalizedContext) -> bool:
+    """True iff at least one telemetry source has direct evidence.
+
+    Direct evidence means:
+
+    * A log/metric/trace/deploy line that names the alerting service, OR
+    * A DB record fetched *for this alert's* transaction_id / policy_id
+      identifiers (as declared in ``alert.labels``), OR
+    * An Aerospike record fetched for the same alert-carried
+      transaction_id / policy_id / idempotency_key.
+
+    Similar-incidents and dependency-graph responses are excluded on
+    purpose: the historical KB and topology map always return "something"
+    for any query, so leaning on them would let a hallucinated RCA slip
+    through the guardrail.
+    """
+    service = context.alert.service.lower()
+    if any(log.service.lower() == service for log in context.logs):
+        return True
+    if any(m.service.lower() == service for m in context.metrics):
+        return True
+    if any(d.service.lower() == service for d in context.deployments):
+        return True
+    if any(t.service.lower() == service for t in context.traces):
+        return True
+
+    # DB rows only count when they were fetched for the *specific*
+    # identifiers the alert already carries. Otherwise the LLM could
+    # dredge up unrelated rows and claim them as evidence.
+    labels = {k.lower(): v for k, v in (context.alert.labels or {}).items()}
+    tx_id = labels.get("transactionid") or labels.get("transaction_id")
+    policy_id = labels.get("policyid") or labels.get("policy_id")
+    idem_key = labels.get("idempotencykey") or labels.get("idempotency_key")
+    for rec in context.db_records:
+        if not rec.available or rec.row_count == 0:
+            continue
+        p = {k.lower(): v for k, v in (rec.params or {}).items()}
+        if tx_id and str(p.get("transaction_id", "")) == str(tx_id):
+            return True
+        if policy_id and str(p.get("policy_id", "")) == str(policy_id):
+            return True
+
+    # Aerospike records: same rule. The record must have been fetched
+    # for one of the alert's own identifiers AND the key must have been
+    # found (a not-found lookup is still valuable *context*, but it is
+    # not evidence *of the service failing right now*).
+    for rec in context.aerospike_records:
+        if not rec.available or not rec.found:
+            continue
+        p = {k.lower(): v for k, v in (rec.params or {}).items()}
+        if tx_id and str(p.get("transaction_id", "")) == str(tx_id):
+            return True
+        if policy_id and str(p.get("policy_id", "")) == str(policy_id):
+            return True
+        if idem_key and str(p.get("idempotency_key", "")) == str(idem_key):
+            return True
+    return False

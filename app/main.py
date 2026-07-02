@@ -19,7 +19,9 @@ from app.api.routes.investigations import router as investigations_router
 from app.config import get_settings
 from app.core.exceptions import RCAError
 from app.core.logging import configure_logging, get_logger
+from app.services.aerospike_client import get_aerospike_client
 from app.services.data_store import get_store
+from app.services.database import get_db_client
 from app.tools.registry import get_registry
 
 log = get_logger(__name__)
@@ -34,6 +36,10 @@ async def lifespan(app: FastAPI):
     llm = get_llm()
     registry = get_registry()
     store = get_store()
+    db = get_db_client()
+    aerospike = get_aerospike_client()
+    await db.connect()
+    await aerospike.connect()
 
     log.info(
         "app.startup",
@@ -43,11 +49,18 @@ async def lifespan(app: FastAPI):
         tools=registry.names(),
         seeded_logs=len(store.logs),
         seeded_metrics=len(store.metrics),
+        db_configured=db.is_configured,
+        db_connected=db.is_connected,
+        aerospike_configured=aerospike.is_configured,
+        aerospike_connected=aerospike.is_connected,
     )
 
-    yield
-
-    log.info("app.shutdown")
+    try:
+        yield
+    finally:
+        await db.close()
+        await aerospike.close()
+        log.info("app.shutdown")
 
 
 def create_app() -> FastAPI:

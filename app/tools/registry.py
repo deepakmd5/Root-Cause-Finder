@@ -56,6 +56,8 @@ def get_registry() -> ToolRegistry:
 
 
 def _build_default_registry() -> ToolRegistry:
+    from app.tools.aerospike_tool import QueryAerospikeTool
+    from app.tools.database_tool import QueryDatabaseTool
     from app.tools.dependencies_tool import ServiceDependenciesTool
     from app.tools.deployments_tool import RecentDeploymentsTool
     from app.tools.logs_tool import SearchLogsTool
@@ -70,6 +72,8 @@ def _build_default_registry() -> ToolRegistry:
     registry.register(FetchTracesTool())
     registry.register(ServiceDependenciesTool())
     registry.register(FindSimilarIncidentsTool())
+    registry.register(QueryDatabaseTool())
+    registry.register(QueryAerospikeTool())
     return registry
 
 
